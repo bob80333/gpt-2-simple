@@ -33,8 +33,8 @@ def load_dataset(enc, path, combine):
             start_token = "<|startoftext|>"
             end_token = "<|endoftext|>"
             with open(path, 'r', encoding='utf8', errors='ignore') as fp:
-                fp.readline()   # skip header
-                reader = csv.reader(fp)
+                #fp.readline()   # csv reader should handle header
+                reader = csv.reader(fp, quoting=csv.QUOTE_ALL)
                 for row in reader:
                     raw_text += start_token + row[0] + end_token + "\n"
         else:
