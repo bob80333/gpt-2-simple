@@ -535,7 +535,7 @@ def encode_csv(csv_path, out_path='csv_encoded.txt', header=True,
         with open(out_path, 'w', encoding='utf8', errors='ignore') as w:
             if header:
                 f.readline()
-            reader = csv.reader(f)
+            reader = csv.reader(f, quoting=csv.QUOTE_ALL)
             for row in reader:
                 w.write(start_token + row[0] + end_token + "\n")
 
