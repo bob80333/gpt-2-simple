@@ -369,7 +369,7 @@ def one_lr_cycle(sess,
         opt_apply = opt.apply_gradients()
         summary_loss = tf.summary.scalar('loss', opt_apply)
     else:
-        opt = tf.train.AdamOptimizer(learning_rate=learning_rate)
+        opt = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
         if use_memory_saving_gradients:
             opt_grads = memory_saving_gradients.gradients(loss, train_vars)
         else:
