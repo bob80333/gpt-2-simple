@@ -290,12 +290,12 @@ def finetune(sess,
 
 def one_lr_cycle(sess,
                  dataset,
-                 steps=5000,
+                 steps=10000,
                  model_name='117M',
                  combine=50000,
                  batch_size=1,
-                 intial_lr=1e-12,
-                 final_lr=1e2,
+                 intial_lr=1e-10,
+                 final_lr=1,
                  accumulate_gradients=5,
                  restore_from='fresh',
                  run_name='run1',
@@ -303,10 +303,8 @@ def one_lr_cycle(sess,
                  use_memory_saving_gradients=False,
                  only_train_transformer_layers=False,
                  overwrite=False):
-    """Does one LR cycle from initial to final over steps iterations
-
-    LR is cycled from 1e-12 to 1e2 over 100 steps, with each step being 50 iterations, averaging loss over them to
-    reduce noise
+    """Does one LR half-cycle from initial to final over steps iterations using CLR algorithm
+    https://github.com/bckenstler/CLR
 
     Adapted from https://github.com/nshepperd/gpt-2/blob/finetuning/train.py.
     See that file for parameter definitions.
@@ -353,7 +351,9 @@ def one_lr_cycle(sess,
     learning_rate = tf.placeholder(tf.float32, shape=[])
 
     def get_lr():
-        lr = intial_lr * (1.3803842646 ** (current_iter + 1))
+        cycle = np.floor(1 + current_iter / (2 * steps))
+        x = np.abs(current_iter / steps - 2 * cycle + 1)
+        lr = intial_lr + (final_lr - intial_lr) * np.maximum(0, (1 - x)) #* scale_fn(x)
         return lr
 
     all_vars = [v for v in tf.trainable_variables() if 'model' in v.name]
@@ -449,9 +449,7 @@ def one_lr_cycle(sess,
                 lr=get_lr()))
 
             counter += 1
-            #avg of 50 per lr
-            if counter % 50 == 0:
-                current_iter += 1
+            current_iter += 1
     except KeyboardInterrupt:
         print('interrupted')
 
