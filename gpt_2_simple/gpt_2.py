@@ -347,6 +347,7 @@ def one_lr_cycle(sess,
             labels=context[:, 1:], logits=output['logits'][:, :-1]))
 
     current_iter = 0
+    learning_rate = tf.placeholder(tf.float32, shape=[])
 
     def get_lr():
         lr = intial_lr * (1.0232929923 ** (current_iter + 1))
@@ -358,14 +359,14 @@ def one_lr_cycle(sess,
         if use_memory_saving_gradients:
             exit("Memory saving gradients are not implemented for gradient accumulation yet.")
         opt = AccumulatingOptimizer(
-            opt=tf.train.AdamOptimizer(learning_rate=get_lr),
+            opt=tf.train.AdamOptimizer(learning_rate=learning_rate),
             var_list=train_vars)
         opt_reset = opt.reset()
         opt_compute = opt.compute_gradients(loss)
         opt_apply = opt.apply_gradients()
         summary_loss = tf.summary.scalar('loss', opt_apply)
     else:
-        opt = tf.train.AdamOptimizer(learning_rate=get_lr)
+        opt = tf.train.AdamOptimizer(learning_rate=learning_rate)
         if use_memory_saving_gradients:
             opt_grads = memory_saving_gradients.gradients(loss, train_vars)
         else:
@@ -429,12 +430,12 @@ def one_lr_cycle(sess,
                 sess.run(opt_reset)
                 for _ in range(accumulate_gradients):
                     sess.run(
-                        opt_compute, feed_dict={context: sample_batch()})
+                        opt_compute, feed_dict={context: sample_batch(), learning_rate: get_lr()})
                 (v_loss, v_summary) = sess.run((opt_apply, summary_loss))
             else:
                 (_, v_loss, v_summary) = sess.run(
                     (opt_apply, loss, summary_loss),
-                    feed_dict={context: sample_batch()})
+                    feed_dict={context: sample_batch(), learning_rate: get_lr()})
 
             summary_log.add_summary(v_summary, counter)
 
@@ -443,7 +444,7 @@ def one_lr_cycle(sess,
                 counter=counter,
                 time=time.time() - start_time,
                 loss=v_loss,
-                lr=get_lr()))
+                lr=opt._lr))
 
             counter += 1
             current_iter += 1
