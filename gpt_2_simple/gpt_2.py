@@ -1,18 +1,22 @@
-import tarfile
-import os
+import argparse
+import csv
 import json
-import requests
-import sys
-import shutil
+import os
 import re
-from tqdm import tqdm, trange
-import numpy as np
-import tensorflow as tf
-from tensorflow.core.protobuf import rewriter_config_pb2
+import shutil
+import sys
+import tarfile
 import time
 from datetime import datetime
-import csv
-import argparse
+
+import numpy as np
+import requests
+import tensorflow as tf
+from tensorflow.core.protobuf import rewriter_config_pb2
+from tensorflow.python.eager import context
+from tensorflow.python.framework import ops
+from tensorflow.python.ops import math_ops
+from tqdm import tqdm, trange
 
 # if in Google Colaboratory
 try:
@@ -288,6 +292,238 @@ def finetune(sess,
         save()
 
 
+def finetune_lr_cycle(sess,
+                      dataset,
+                      steps=-1,
+                      model_name='117M',
+                      combine=50000,
+                      batch_size=1,
+                      base_lr=0.001,
+                      max_lr=0.006,
+                      cycle_steps=10000,
+                      accumulate_gradients=5,
+                      restore_from='latest',
+                      run_name='run1',
+                      sample_every=100,
+                      sample_length=1023,
+                      sample_num=1,
+                      save_every=1000,
+                      print_every=1,
+                      max_checkpoints=1,
+                      use_memory_saving_gradients=False,
+                      only_train_transformer_layers=False,
+                      overwrite=False):
+    """Finetunes the model on the given dataset using a cyclical lr
+
+    Adapted from https://github.com/nshepperd/gpt-2/blob/finetuning/train.py.
+    See that file for parameter definitions.
+    """
+
+    CHECKPOINT_DIR = 'checkpoint'
+    SAMPLE_DIR = 'samples'
+
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, run_name)
+
+    def maketree(path):
+        try:
+            os.makedirs(path)
+        except:
+            pass
+
+    maketree(checkpoint_path)
+    files = [f for f in os.listdir(checkpoint_path)]
+    for file in ['hparams.json', 'encoder.json', 'vocab.bpe']:
+        if file not in files:
+            try:
+                shutil.copyfile(os.path.join('models', model_name, file),
+                                os.path.join(checkpoint_path, file))
+            except FileNotFoundError as fnf_error:
+                print("You need to download the GPT-2 model first via download_gpt2()")
+                raise (fnf_error)
+
+    enc = encoder.get_encoder(checkpoint_path)
+    hparams = model.default_hparams()
+    with open(os.path.join(checkpoint_path, 'hparams.json')) as f:
+        hparams.override_from_dict(json.load(f))
+
+    if sample_length > hparams.n_ctx:
+        raise ValueError(
+            "Can't get samples longer than window size: %s" % hparams.n_ctx)
+
+    if model_name != '117M':
+        use_memory_saving_gradients = True
+        only_train_transformer_layers = True
+        accumulate_gradients = 1
+
+    context = tf.placeholder(tf.int32, [batch_size, None])
+    output = model.model(hparams=hparams, X=context)
+    loss = tf.reduce_mean(
+        tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=context[:, 1:], logits=output['logits'][:, :-1]))
+
+    tf_sample = sample.sample_sequence(
+        hparams=hparams,
+        length=sample_length,
+        context=context,
+        batch_size=batch_size,
+        temperature=1.0,
+        top_p=0.9)
+
+    global_step = tf.Variable(0, trainable=False)
+    current_step = 0
+
+    all_vars = [v for v in tf.trainable_variables() if 'model' in v.name]
+    train_vars = [v for v in all_vars if '/h' in v.name] if only_train_transformer_layers else all_vars
+    if accumulate_gradients > 1:
+        if use_memory_saving_gradients:
+            exit("Memory saving gradients are not implemented for gradient accumulation yet.")
+        opt = AccumulatingOptimizer(
+            opt=tf.train.AdamOptimizer(
+                learning_rate=cyclic_learning_rate(global_step=global_step, step_size=cycle_steps / 2,
+                                                   learning_rate=base_lr, max_lr=max_lr, mode='triangular2')),
+            var_list=train_vars)
+        opt_reset = opt.reset()
+        opt_compute = opt.compute_gradients(loss)
+        opt_apply = opt.apply_gradients()
+        summary_loss = tf.summary.scalar('loss', opt_apply)
+    else:
+        opt = tf.train.AdamOptimizer(
+            learning_rate=cyclic_learning_rate(global_step=global_step, step_size=cycle_steps / 2,
+                                               learning_rate=base_lr, max_lr=max_lr, mode='triangular2'))
+        if use_memory_saving_gradients:
+            opt_grads = memory_saving_gradients.gradients(loss, train_vars)
+        else:
+            opt_grads = tf.gradients(loss, train_vars)
+        opt_grads = list(zip(opt_grads, train_vars))
+        opt_apply = opt.apply_gradients(opt_grads)
+        summary_loss = tf.summary.scalar('loss', loss)
+
+    summary_log = tf.summary.FileWriter(checkpoint_path)
+
+    saver = tf.train.Saver(
+        var_list=all_vars,
+        max_to_keep=max_checkpoints)
+    sess.run(tf.global_variables_initializer())
+
+    if restore_from == 'latest':
+        ckpt = tf.train.latest_checkpoint(checkpoint_path)
+        if ckpt is None:
+            # Get fresh GPT weights if new run.
+            ckpt = tf.train.latest_checkpoint(
+                os.path.join('models', model_name))
+    elif restore_from == 'fresh':
+        ckpt = tf.train.latest_checkpoint(
+            os.path.join('models', model_name))
+    else:
+        ckpt = tf.train.latest_checkpoint(restore_from)
+    print('Loading checkpoint', ckpt)
+    saver.restore(sess, ckpt)
+
+    print('Loading dataset...')
+    chunks = load_dataset(enc, dataset, combine)
+    data_sampler = Sampler(chunks)
+    print('dataset has', data_sampler.total_size, 'tokens')
+    print('Training...')
+
+    counter = 1
+    counter_path = os.path.join(checkpoint_path, 'counter')
+    if os.path.exists(counter_path) and restore_from == 'latest':
+        # Load the step number if we're resuming a run
+        # Add 1 so we don't immediately try to save again
+        with open(counter_path, 'r') as fp:
+            counter = int(fp.read()) + 1
+    counter_base = counter
+
+    def save():
+        maketree(checkpoint_path)
+        print(
+            'Saving',
+            os.path.join(checkpoint_path,
+                         'model-{}').format(counter - 1))
+        saver.save(
+            sess,
+            os.path.join(checkpoint_path, 'model'),
+            global_step=counter - 1)
+        with open(counter_path, 'w') as fp:
+            fp.write(str(counter - 1) + '\n')
+
+    def generate_samples():
+        context_tokens = data_sampler.sample(1)
+        all_text = []
+        index = 0
+        while index < sample_num:
+            out = sess.run(
+                tf_sample,
+                feed_dict={context: batch_size * [context_tokens]})
+            for i in range(min(sample_num - index, batch_size)):
+                text = enc.decode(out[i])
+                text = '======== SAMPLE {} ========\n{}\n'.format(
+                    index + 1, text)
+                all_text.append(text)
+                index += 1
+        print(text)
+        maketree(os.path.join(SAMPLE_DIR, run_name))
+        with open(
+                os.path.join(SAMPLE_DIR, run_name,
+                             'samples-{}').format(counter), 'w', encoding='utf8') as fp:
+            fp.write('\n'.join(all_text))
+
+    def sample_batch():
+        return [data_sampler.sample(1024) for _ in range(batch_size)]
+
+    if overwrite and restore_from == 'latest':
+        for file in files:
+            if file.startswith('model') or file.startswith('events'):
+                os.remove(os.path.join(checkpoint_path, file))
+        save()
+
+    avg_loss = (0.0, 0.0)
+    start_time = time.time()
+
+    try:
+        while True:
+            if steps > 0 and counter == (counter_base + steps):
+                save()
+                return
+            if (counter - 1) % save_every == 0 and counter > 1:
+                save()
+            if (counter - 1) % sample_every == 0 and counter > 1:
+                generate_samples()
+
+            if accumulate_gradients > 1:
+                sess.run(opt_reset)
+                for _ in range(accumulate_gradients):
+                    sess.run(
+                        opt_compute, feed_dict={context: sample_batch()})
+                (v_loss, v_summary) = sess.run((opt_apply, summary_loss))
+            else:
+                (_, v_loss, v_summary) = sess.run(
+                    (opt_apply, loss, summary_loss),
+                    feed_dict={context: sample_batch()})
+
+            summary_log.add_summary(v_summary, counter)
+
+            if counter % print_every == 0:
+                avg_loss = (avg_loss[0] * 0.99 + v_loss,
+                            avg_loss[1] * 0.99 + 1.0)
+
+                print(
+                    '[{counter} | {time:2.2f}] loss={loss:2.2f} avg={avg:2.2f}'
+                        .format(
+                        counter=counter,
+                        time=time.time() - start_time,
+                        loss=v_loss,
+                        avg=avg_loss[0] / avg_loss[1]))
+
+            counter += 1
+            current_step += 1
+            assign_op = global_step.assign(current_step)
+            sess.run(assign_op)
+    except KeyboardInterrupt:
+        print('interrupted')
+        save()
+
+
 def one_lr_cycle(sess,
                  dataset,
                  steps=10000,
@@ -353,7 +589,7 @@ def one_lr_cycle(sess,
     def get_lr():
         cycle = np.floor(1 + current_iter / (2 * steps))
         x = np.abs(current_iter / steps - 2 * cycle + 1)
-        lr = intial_lr + (final_lr - intial_lr) * np.maximum(0, (1 - x)) #* scale_fn(x)
+        lr = intial_lr + (final_lr - intial_lr) * np.maximum(0, (1 - x))  # * scale_fn(x)
         return lr
 
     all_vars = [v for v in tf.trainable_variables() if 'model' in v.name]
@@ -879,3 +1115,122 @@ def cmd_generate(nfiles, nsamples, folder,
                          top_k=top_k,
                          top_p=top_p
                          )
+
+
+# Source: https://github.com/mhmoodlan/cyclic-learning-rate
+
+def cyclic_learning_rate(global_step,
+                         learning_rate=0.01,
+                         max_lr=0.1,
+                         step_size=20.,
+                         gamma=0.99994,
+                         mode='triangular',
+                         name=None):
+    """Applies cyclic learning rate (CLR).
+       From the paper:
+       Smith, Leslie N. "Cyclical learning
+       rates for training neural networks." 2017.
+       [https://arxiv.org/pdf/1506.01186.pdf]
+        This method lets the learning rate cyclically
+       vary between reasonable boundary values
+       achieving improved classification accuracy and
+       often in fewer iterations.
+        This code varies the learning rate linearly between the
+       minimum (learning_rate) and the maximum (max_lr).
+        It returns the cyclic learning rate. It is computed as:
+         ```python
+         cycle = floor( 1 + global_step /
+          ( 2 * step_size ) )
+        x = abs( global_step / step_size – 2 * cycle + 1 )
+        clr = learning_rate +
+          ( max_lr – learning_rate ) * max( 0 , 1 - x )
+         ```
+        Polices:
+          'triangular':
+            Default, linearly increasing then linearly decreasing the
+            learning rate at each cycle.
+           'triangular2':
+            The same as the triangular policy except the learning
+            rate difference is cut in half at the end of each cycle.
+            This means the learning rate difference drops after each cycle.
+           'exp_range':
+            The learning rate varies between the minimum and maximum
+            boundaries and each boundary value declines by an exponential
+            factor of: gamma^global_step.
+         Example: 'triangular2' mode cyclic learning rate.
+          '''python
+          ...
+          global_step = tf.Variable(0, trainable=False)
+          optimizer = tf.train.AdamOptimizer(learning_rate=
+            clr.cyclic_learning_rate(global_step=global_step, mode='triangular2'))
+          train_op = optimizer.minimize(loss_op, global_step=global_step)
+          ...
+           with tf.Session() as sess:
+              sess.run(init)
+              for step in range(1, num_steps+1):
+                assign_op = global_step.assign(step)
+                sess.run(assign_op)
+          ...
+           '''
+         Args:
+          global_step: A scalar `int32` or `int64` `Tensor` or a Python number.
+            Global step to use for the cyclic computation.  Must not be negative.
+          learning_rate: A scalar `float32` or `float64` `Tensor` or a
+          Python number.  The initial learning rate which is the lower bound
+            of the cycle (default = 0.1).
+          max_lr:  A scalar. The maximum learning rate boundary.
+          step_size: A scalar. The number of iterations in half a cycle.
+            The paper suggests step_size = 2-8 x training iterations in epoch.
+          gamma: constant in 'exp_range' mode:
+            gamma**(global_step)
+          mode: one of {triangular, triangular2, exp_range}.
+              Default 'triangular'.
+              Values correspond to policies detailed above.
+          name: String.  Optional name of the operation.  Defaults to
+            'CyclicLearningRate'.
+         Returns:
+          A scalar `Tensor` of the same type as `learning_rate`.  The cyclic
+          learning rate.
+        Raises:
+          ValueError: if `global_step` is not supplied.
+        @compatibility(eager)
+        When eager execution is enabled, this function returns
+        a function which in turn returns the decayed learning
+        rate Tensor. This can be useful for changing the learning
+        rate value across different invocations of optimizer functions.
+        @end_compatibility
+    """
+    if global_step is None:
+        raise ValueError("global_step is required for cyclic_learning_rate.")
+    with ops.name_scope(name, "CyclicLearningRate",
+                        [learning_rate, global_step]) as name:
+        learning_rate = ops.convert_to_tensor(learning_rate, name="learning_rate")
+        dtype = learning_rate.dtype
+        global_step = math_ops.cast(global_step, dtype)
+        step_size = math_ops.cast(step_size, dtype)
+
+        def cyclic_lr():
+            """Helper to recompute learning rate; most helpful in eager-mode."""
+            # computing: cycle = floor( 1 + global_step / ( 2 * step_size ) )
+            double_step = math_ops.multiply(2., step_size)
+            global_div_double_step = math_ops.divide(global_step, double_step)
+            cycle = math_ops.floor(math_ops.add(1., global_div_double_step))
+            # computing: x = abs( global_step / step_size – 2 * cycle + 1 )
+            double_cycle = math_ops.multiply(2., cycle)
+            global_div_step = math_ops.divide(global_step, step_size)
+            tmp = math_ops.subtract(global_div_step, double_cycle)
+            x = math_ops.abs(math_ops.add(1., tmp))
+            # computing: clr = learning_rate + ( max_lr – learning_rate ) * max( 0, 1 - x )
+            a1 = math_ops.maximum(0., math_ops.subtract(1., x))
+            a2 = math_ops.subtract(max_lr, learning_rate)
+            clr = math_ops.multiply(a1, a2)
+            if mode == 'triangular2':
+                clr = math_ops.divide(clr, math_ops.cast(math_ops.pow(2, math_ops.cast(
+                    cycle - 1, tf.int32)), tf.float32))
+            if mode == 'exp_range':
+                clr = math_ops.multiply(math_ops.pow(gamma, global_step), clr)
+            return math_ops.add(clr, learning_rate, name=name)
+
+        if not context.executing_eagerly():
+            cyclic_lr = cyclic_lr()
+        return cyclic_lr
