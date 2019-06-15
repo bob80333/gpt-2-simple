@@ -349,9 +349,7 @@ def one_lr_cycle(sess,
     current_iter = 0
 
     def get_lr():
-        cycle = np.floor(1 + current_iter / (steps))
-        x = np.abs(current_iter / steps - 2 * cycle + 1)
-        lr = intial_lr + (final_lr - intial_lr) * np.maximum(0, (1 - x)) #* scale_fn(x)
+        lr = intial_lr * (1.0232929923 ** (current_iter + 1))
         return lr
 
     all_vars = [v for v in tf.trainable_variables() if 'model' in v.name]
