@@ -113,7 +113,7 @@ def finetune(sess,
                                 os.path.join(checkpoint_path, file))
             except FileNotFoundError as fnf_error:
                 print("You need to download the GPT-2 model first via download_gpt2()")
-                raise(fnf_error)
+                raise (fnf_error)
 
     enc = encoder.get_encoder(checkpoint_path)
     hparams = model.default_hparams()
@@ -206,13 +206,13 @@ def finetune(sess,
         print(
             'Saving',
             os.path.join(checkpoint_path,
-                         'model-{}').format(counter-1))
+                         'model-{}').format(counter - 1))
         saver.save(
             sess,
             os.path.join(checkpoint_path, 'model'),
-            global_step=counter-1)
+            global_step=counter - 1)
         with open(counter_path, 'w') as fp:
-            fp.write(str(counter-1) + '\n')
+            fp.write(str(counter - 1) + '\n')
 
     def generate_samples():
         context_tokens = data_sampler.sample(1)
@@ -276,7 +276,7 @@ def finetune(sess,
 
                 print(
                     '[{counter} | {time:2.2f}] loss={loss:2.2f} avg={avg:2.2f}'
-                    .format(
+                        .format(
                         counter=counter,
                         time=time.time() - start_time,
                         loss=v_loss,
@@ -286,6 +286,170 @@ def finetune(sess,
     except KeyboardInterrupt:
         print('interrupted')
         save()
+
+
+def one_lr_cycle(sess,
+                 dataset,
+                 steps=1000,
+                 model_name='117M',
+                 combine=50000,
+                 batch_size=1,
+                 intial_lr=1e-8,
+                 final_lr=1e2,
+                 accumulate_gradients=5,
+                 restore_from='fresh',
+                 run_name='run1',
+                 max_checkpoints=1,
+                 use_memory_saving_gradients=False,
+                 only_train_transformer_layers=False,
+                 overwrite=False):
+    """Does one LR cycle from initial to final over steps iterations
+
+    Adapted from https://github.com/nshepperd/gpt-2/blob/finetuning/train.py.
+    See that file for parameter definitions.
+    """
+
+    CHECKPOINT_DIR = 'checkpoint'
+
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, run_name)
+
+    def maketree(path):
+        try:
+            os.makedirs(path)
+        except:
+            pass
+
+    maketree(checkpoint_path)
+    files = [f for f in os.listdir(checkpoint_path)]
+    for file in ['hparams.json', 'encoder.json', 'vocab.bpe']:
+        if file not in files:
+            try:
+                shutil.copyfile(os.path.join('models', model_name, file),
+                                os.path.join(checkpoint_path, file))
+            except FileNotFoundError as fnf_error:
+                print("You need to download the GPT-2 model first via download_gpt2()")
+                raise (fnf_error)
+
+    enc = encoder.get_encoder(checkpoint_path)
+    hparams = model.default_hparams()
+    with open(os.path.join(checkpoint_path, 'hparams.json')) as f:
+        hparams.override_from_dict(json.load(f))
+
+    if model_name != '117M':
+        use_memory_saving_gradients = True
+        only_train_transformer_layers = True
+        accumulate_gradients = 1
+
+    context = tf.placeholder(tf.int32, [batch_size, None])
+    output = model.model(hparams=hparams, X=context)
+    loss = tf.reduce_mean(
+        tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=context[:, 1:], logits=output['logits'][:, :-1]))
+
+    current_iter = 0
+
+    def get_lr():
+        diff_lr = final_lr - intial_lr
+        slope = diff_lr / steps
+        return (current_iter + 1) * slope
+
+    all_vars = [v for v in tf.trainable_variables() if 'model' in v.name]
+    train_vars = [v for v in all_vars if '/h' in v.name] if only_train_transformer_layers else all_vars
+    if accumulate_gradients > 1:
+        if use_memory_saving_gradients:
+            exit("Memory saving gradients are not implemented for gradient accumulation yet.")
+        opt = AccumulatingOptimizer(
+            opt=tf.train.AdamOptimizer(learning_rate=get_lr),
+            var_list=train_vars)
+        opt_reset = opt.reset()
+        opt_compute = opt.compute_gradients(loss)
+        opt_apply = opt.apply_gradients()
+        summary_loss = tf.summary.scalar('loss', opt_apply)
+    else:
+        opt = tf.train.AdamOptimizer(learning_rate=get_lr)
+        if use_memory_saving_gradients:
+            opt_grads = memory_saving_gradients.gradients(loss, train_vars)
+        else:
+            opt_grads = tf.gradients(loss, train_vars)
+        opt_grads = list(zip(opt_grads, train_vars))
+        opt_apply = opt.apply_gradients(opt_grads)
+        summary_loss = tf.summary.scalar('loss', loss)
+
+    summary_log = tf.summary.FileWriter(checkpoint_path)
+
+    saver = tf.train.Saver(
+        var_list=all_vars,
+        max_to_keep=max_checkpoints)
+    sess.run(tf.global_variables_initializer())
+
+    if restore_from == 'latest':
+        ckpt = tf.train.latest_checkpoint(checkpoint_path)
+        if ckpt is None:
+            # Get fresh GPT weights if new run.
+            ckpt = tf.train.latest_checkpoint(
+                os.path.join('models', model_name))
+    elif restore_from == 'fresh':
+        ckpt = tf.train.latest_checkpoint(
+            os.path.join('models', model_name))
+    else:
+        ckpt = tf.train.latest_checkpoint(restore_from)
+    print('Loading checkpoint', ckpt)
+    saver.restore(sess, ckpt)
+
+    print('Loading dataset...')
+    chunks = load_dataset(enc, dataset, combine)
+    data_sampler = Sampler(chunks)
+    print('dataset has', data_sampler.total_size, 'tokens')
+    print('Training...')
+
+    counter = 1
+    counter_path = os.path.join(checkpoint_path, 'counter')
+    if os.path.exists(counter_path) and restore_from == 'latest':
+        # Load the step number if we're resuming a run
+        # Add 1 so we don't immediately try to save again
+        with open(counter_path, 'r') as fp:
+            counter = int(fp.read()) + 1
+    counter_base = counter
+
+    def sample_batch():
+        return [data_sampler.sample(1024) for _ in range(batch_size)]
+
+    if overwrite and restore_from == 'latest':
+        for file in files:
+            if file.startswith('model') or file.startswith('events'):
+                os.remove(os.path.join(checkpoint_path, file))
+
+    start_time = time.time()
+
+    try:
+        while True:
+            if steps > 0 and counter == (counter_base + steps):
+                return
+
+            if accumulate_gradients > 1:
+                sess.run(opt_reset)
+                for _ in range(accumulate_gradients):
+                    sess.run(
+                        opt_compute, feed_dict={context: sample_batch()})
+                (v_loss, v_summary) = sess.run((opt_apply, summary_loss))
+            else:
+                (_, v_loss, v_summary) = sess.run(
+                    (opt_apply, loss, summary_loss),
+                    feed_dict={context: sample_batch()})
+
+            summary_log.add_summary(v_summary, counter)
+
+            print('[{counter} | {time:2.2f}] loss={loss:2.8f} lr={lr:2.8f}'
+                .format(
+                counter=counter,
+                time=time.time() - start_time,
+                loss=v_loss,
+                lr=get_lr()))
+
+            counter += 1
+            current_iter += 1
+    except KeyboardInterrupt:
+        print('interrupted')
 
 
 def load_gpt2(sess,
@@ -375,8 +539,8 @@ def generate(sess,
             out = sess.run(output)
         else:
             out = sess.run(output, feed_dict={
-                    context: batch_size * [context_tokens]
-                })
+                context: batch_size * [context_tokens]
+            })
         for i in range(batch_size):
             generated += 1
             gen_text = enc.decode(out[i])
@@ -565,72 +729,72 @@ def cmd():
     )
 
     # Explicit arguments
-    
+
     parser.add_argument(
         '--mode', help='Mode for using the CLI (either "finetune" or "generate") [Required]', nargs='?')
     parser.add_argument(
-        '--run_name',  help="[finetune/generate] Run number to save/load the model",
+        '--run_name', help="[finetune/generate] Run number to save/load the model",
         nargs='?', default='run1')
     parser.add_argument(
-        '--model_name',  help="[finetune] Name of the GPT-2 model to finetune",
+        '--model_name', help="[finetune] Name of the GPT-2 model to finetune",
         nargs='?', default='117M')
     parser.add_argument(
-        '--dataset',  help="[finetune] Path to the source text.",
+        '--dataset', help="[finetune] Path to the source text.",
         nargs='?', default=None)
     parser.add_argument(
-        '--steps',  help="[finetune] Number of steps to train (-1 for infinite)",
+        '--steps', help="[finetune] Number of steps to train (-1 for infinite)",
         nargs='?', default=-1)
     parser.add_argument(
-        '--restore_from',  help="[finetune] Whether to load model 'fresh' or from 'latest' checkpoint.",
+        '--restore_from', help="[finetune] Whether to load model 'fresh' or from 'latest' checkpoint.",
         nargs='?', default='latest')
     parser.add_argument(
-        '--sample_every',  help="[finetune] After how many steps to print sample",
+        '--sample_every', help="[finetune] After how many steps to print sample",
         nargs='?', default=1000000, type=int)
     parser.add_argument(
-        '--save_every',  help="[finetune] After how many steps to save checkpoint",
+        '--save_every', help="[finetune] After how many steps to save checkpoint",
         nargs='?', default=100, type=int)
     parser.add_argument(
-        '--print_every',  help="[finetune] After how many steps to print progress",
+        '--print_every', help="[finetune] After how many steps to print progress",
         nargs='?', default=10, type=int)
     parser.add_argument(
-        '--overwrite',  help="[finetune] Overwrite existing model when continuing training",
+        '--overwrite', help="[finetune] Overwrite existing model when continuing training",
         nargs='?', default=False, type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument(
-        '--nfiles',  help="[generate] How many files to generate.",
+        '--nfiles', help="[generate] How many files to generate.",
         nargs='?', default=1, type=int)
     parser.add_argument(
-        '--nsamples',  help="[generate] How many texts to generate.",
+        '--nsamples', help="[generate] How many texts to generate.",
         nargs='?', default=1, type=int)
     parser.add_argument(
-        '--folder',  help="[generate] Folder to save the generated files",
+        '--folder', help="[generate] Folder to save the generated files",
         nargs='?', default="gen", type=str)
     parser.add_argument(
-        '--length',  help="[generate] Length (tokens) of the generated texts",
+        '--length', help="[generate] Length (tokens) of the generated texts",
         nargs='?', default=1023, type=int)
     parser.add_argument(
-        '--temperature',  help="[generate] Temperature of the generated texts",
+        '--temperature', help="[generate] Temperature of the generated texts",
         nargs='?', default=0.7, type=float)
     parser.add_argument(
-        '--top_k',  help="[generate] Sample only from top k tokens",
+        '--top_k', help="[generate] Sample only from top k tokens",
         nargs='?', default=0, type=int)
     parser.add_argument(
-        '--top_p',  help="[generate] Sample from top p prob (overrides top_k if nonzero)",
+        '--top_p', help="[generate] Sample from top p prob (overrides top_k if nonzero)",
         nargs='?', default=0.0, type=float)
     parser.add_argument(
-        '--batch_size',  help="[generate] Batch size for generation (increase for GPUs)",
+        '--batch_size', help="[generate] Batch size for generation (increase for GPUs)",
         nargs='?', default=1, type=int)
     parser.add_argument(
-        '--prefix',  help="[generate] Prefix for generated texts",
+        '--prefix', help="[generate] Prefix for generated texts",
         nargs='?', default=None)
     parser.add_argument(
-        '--truncate',  help="[generate] Truncation for generated texts",
+        '--truncate', help="[generate] Truncation for generated texts",
         nargs='?', default=None)
     # https://stackoverflow.com/a/46951029
     parser.add_argument(
-        '--include_prefix',  help="[generate] Include prefix when truncating.",
+        '--include_prefix', help="[generate] Include prefix when truncating.",
         nargs='?', default=True, type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument(
-        '--sample_delim',  help="[generate] Delimiter between each generated sample.",
+        '--sample_delim', help="[generate] Delimiter between each generated sample.",
         nargs='?', default='=' * 20 + '\n', type=str)
 
     # Positional arguments
@@ -698,7 +862,7 @@ def cmd_generate(nfiles, nsamples, folder,
 
     for _ in trange(nfiles):
         gen_file = os.path.join(folder,
-                    'gpt2_gentext_{:%Y%m%d_%H%M%S}.txt'.format(datetime.utcnow()))
+                                'gpt2_gentext_{:%Y%m%d_%H%M%S}.txt'.format(datetime.utcnow()))
 
         generate_to_file(sess,
                          destination_path=gen_file,
