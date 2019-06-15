@@ -438,7 +438,7 @@ def one_lr_cycle(sess,
 
             summary_log.add_summary(v_summary, counter)
 
-            print('[{counter} | {time:2.2f}] loss={loss:2.8f} lr={lr:2.8f}'
+            print('[{counter} | {time:2.2f}] loss={loss:3.12f} lr={lr:2.12f}'
                 .format(
                 counter=counter,
                 time=time.time() - start_time,
