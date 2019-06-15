@@ -290,7 +290,7 @@ def finetune(sess,
 
 def one_lr_cycle(sess,
                  dataset,
-                 steps=1000,
+                 steps=5000,
                  model_name='117M',
                  combine=50000,
                  batch_size=1,
@@ -446,7 +446,9 @@ def one_lr_cycle(sess,
                 lr=get_lr()))
 
             counter += 1
-            current_iter += 1
+            #avg of 5 per lr
+            if counter % 5 == 0:
+                current_iter += 1
     except KeyboardInterrupt:
         print('interrupted')
 
