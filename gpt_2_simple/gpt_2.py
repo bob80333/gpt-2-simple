@@ -349,9 +349,10 @@ def one_lr_cycle(sess,
     current_iter = 0
 
     def get_lr():
-        diff_lr = final_lr - intial_lr
-        slope = diff_lr / steps
-        return (current_iter + 1) * slope
+        cycle = np.floor(1 + current_iter / (steps))
+        x = np.abs(current_iter / steps - 2 * cycle + 1)
+        lr = intial_lr + (final_lr - intial_lr) * np.maximum(0, (1 - x)) #* scale_fn(x)
+        return lr
 
     all_vars = [v for v in tf.trainable_variables() if 'model' in v.name]
     train_vars = [v for v in all_vars if '/h' in v.name] if only_train_transformer_layers else all_vars
