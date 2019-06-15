@@ -141,7 +141,7 @@ def finetune(sess,
         context=context,
         batch_size=batch_size,
         temperature=1.0,
-        top_k=40)
+        top_p=0.9)
 
     all_vars = [v for v in tf.trainable_variables() if 'model' in v.name]
     train_vars = [v for v in all_vars if '/h' in v.name] if only_train_transformer_layers else all_vars
