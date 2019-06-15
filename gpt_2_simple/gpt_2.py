@@ -425,7 +425,6 @@ def one_lr_cycle(sess,
         while True:
             if steps > 0 and counter == (counter_base + steps):
                 return
-
             if accumulate_gradients > 1:
                 sess.run(opt_reset)
                 for _ in range(accumulate_gradients):
@@ -444,7 +443,7 @@ def one_lr_cycle(sess,
                 counter=counter,
                 time=time.time() - start_time,
                 loss=v_loss,
-                lr=opt._lr))
+                lr=get_lr()))
 
             counter += 1
             current_iter += 1
