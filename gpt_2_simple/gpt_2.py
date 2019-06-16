@@ -298,8 +298,8 @@ def finetune_lr_cycle(sess,
                       model_name='117M',
                       combine=50000,
                       batch_size=1,
-                      base_lr=0.001,
-                      max_lr=0.006,
+                      base_lr=0.00151,
+                      max_lr=0.00906,
                       cycle_steps=10000,
                       accumulate_gradients=5,
                       restore_from='latest',
@@ -387,7 +387,7 @@ def finetune_lr_cycle(sess,
         opt_apply = opt.apply_gradients()
         summary_loss = tf.summary.scalar('loss', opt_apply)
     else:
-        opt = tf.train.AdamOptimizer(
+        opt = tf.train.GradientDescentOptimizer(
             learning_rate=cyclic_learning_rate(global_step=global_step, step_size=cycle_steps / 2,
                                                learning_rate=base_lr, max_lr=max_lr, mode='triangular2'))
         if use_memory_saving_gradients:
